@@ -44,7 +44,6 @@ def create_understanding_service() -> SectionUnderstandingService:
 def to_response(
     result: SectionUnderstanding,
 ) -> SectionUnderstandingResponse:
-
     return SectionUnderstandingResponse(
         heading=result.heading,
         overview=result.overview,
@@ -55,15 +54,13 @@ def to_response(
             )
             for item in result.key_information
         ],
-        important_points=list(
-            result.important_points
-        ),
+        important_points=list(result.important_points),
         original_text=result.original_text,
     )
 
 
 @router.post(
-    "/understand-section",
+    "/understand",
     response_model=SectionUnderstandingResponse,
 )
 async def understand_section(
@@ -72,7 +69,6 @@ async def understand_section(
         create_understanding_service
     ),
 ) -> SectionUnderstandingResponse:
-
     try:
         result = service.understand(
             heading=request.heading,
