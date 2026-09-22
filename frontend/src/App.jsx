@@ -1,25 +1,364 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
+/* ============================================================
+   01. CONFIGURATION
+   ============================================================ */
+
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
-const USER_KEY = "serff-auth-user";
-const LAST_RESULT_KEY = "serff-last-result";
+const AUTH_STORAGE_KEY = "serff_auth_session";
+const USER_STORAGE_KEY = "serff_users";
 
-const EXPECTED_FIELDS = [
-  ["filingCompany", "Filing company"],
-  ["state", "State"],
-  ["productName", "Product name"],
-  ["serffTracking", "SERFF tracking"],
-  ["filingStatus", "Filing status"],
-  ["stateStatus", "State status"],
-  ["submissionType", "Submission type"],
-  ["toiSubToi", "TOI / Sub-TOI"],
-  ["effectiveDate", "Effective date"],
-  ["receivedDate", "Received date"],
-  ["dispositionDate", "Disposition date"],
+const EMPTY_RESULT = {
+  filename: "",
+  page_count: 0,
+  section_count: 0,
+  sections: [],
+};
+
+
+/* ============================================================
+   02. GENERIC HELPERS
+   ============================================================ */
+
+function normalizeText(value) {
+  return String(value ?? "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+function cleanValue(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function firstNonEmpty(...values) {
+  return values.find((value) => cleanValue(value) !== "") || "";
+}
+
+function formatError(error, fallback = "Something went wrong.") {
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+function isRealDate(value) {
+  return /^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(cleanValue(value));
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+
+/* ============================================================
+   03. FILING FIELD PARSING
+   ============================================================ */
+
+const FILING_GLANCE_LABELS = [
+  "Company",
+  "Product Name",
+  "State",
+  "TOI",
+  "Sub-TOI",
+  "Filing Type",
+  "Date Submitted",
+  "SERFF Tr Num",
+  "SERFF Status",
+  "State Tr Num",
+  "State Status",
+  "Co Tr Num",
+  "Effective Date Requested",
+  "Author(s)",
+  "Reviewer(s)",
+  "Disposition Date",
+  "Disposition Status",
+  "Effective Date",
 ];
+
+const GENERAL_LABELS = [
+  "Submission Type",
+  "Market Type",
+  "Requested Filing Mode",
+  "Filing Description",
+  "Filing Company Name",
+];
+
+const COMPANY_LABELS = [
+  "Project Name",
+  "Project Number",
+  "Submission Type",
+  "Filing Company Name",
+  "State of Domicile",
+  "Market Type",
+  "Requested Filing Mode",
+];
+
+function findExactField(text, label, knownLabels = []) {
+  const source = normalizeText(text);
+  if (!source) return "";
+
+  const otherLabels = knownLabels
+    .filter((item) => item !== label)
+    .sort((a, b) => b.length - a.length)
+    .map((item) => `${escapeRegex(item)}\\s*:`)
+    .join("|");
+
+  const boundary = otherLabels
+    ? `(?=\\n\\s*(?:${otherLabels})|$)`
+    : "(?=$)";
+
+  const pattern = new RegExp(
+    `(?:^|\\n)\\s*${escapeRegex(label)}\\s*:\\s*([\\s\\S]*?)${boundary}`,
+    "i"
+  );
+
+  const match = source.match(pattern);
+  if (match) return cleanValue(match[1]);
+
+  const flattened = cleanValue(source);
+  const flatPattern = new RegExp(
+    `${escapeRegex(label)}\\s*:\\s*([^\\n]*?)(?=\\s+(?:${otherLabels})|$)`,
+    "i"
+  );
+
+  const flatMatch = flattened.match(flatPattern);
+  return flatMatch ? cleanValue(flatMatch[1]) : "";
+}
+
+function findSectionText(result, heading) {
+  const section = result.sections?.find(
+    (item) => cleanValue(item.heading).toLowerCase() === cleanValue(heading).toLowerCase()
+  );
+
+  return section?.text || "";
+}
+
+function buildFilingInfo(result) {
+  const glance = findSectionText(result, "Filing at a Glance");
+  const general = findSectionText(result, "General Information");
+  const company = findSectionText(result, "Company and Contact");
+
+  const getGlance = (label) =>
+    findExactField(glance, label, FILING_GLANCE_LABELS);
+
+  const filingType = firstNonEmpty(getGlance("Filing Type"), "Not available");
+
+  const effectiveDateRaw = getGlance("Effective Date");
+  const effectiveDate = isRealDate(effectiveDateRaw)
+    ? effectiveDateRaw
+    : "Not available";
+
+  const submissionType = firstNonEmpty(
+    findExactField(general, "Submission Type", GENERAL_LABELS),
+    findExactField(company, "Submission Type", COMPANY_LABELS),
+    "Not available"
+  );
+
+  return {
+    filing: filingType,
+    mainActor: firstNonEmpty(
+      getGlance("Company"),
+      "Not available"
+    ),
+    state: firstNonEmpty(getGlance("State"), "Not available"),
+    product: firstNonEmpty(getGlance("Product Name"), "Not available"),
+    serffTracking: firstNonEmpty(
+      getGlance("SERFF Tr Num"),
+      "Not available"
+    ),
+    filingStatus: firstNonEmpty(
+      getGlance("SERFF Status"),
+      "Not available"
+    ),
+    stateStatus: firstNonEmpty(
+      getGlance("State Status"),
+      "Not available"
+    ),
+    submissionType,
+    toi: firstNonEmpty(
+      getGlance("TOI"),
+      "Not available"
+    ),
+    subToi: firstNonEmpty(
+      getGlance("Sub-TOI"),
+      "Not available"
+    ),
+    effectiveDate,
+    receivedDate: "Not available",
+    dispositionDate: firstNonEmpty(
+      getGlance("Disposition Date"),
+      "Not available"
+    ),
+  };
+}
+
+
+/* ============================================================
+   04. SECTION CLASSIFICATION
+   ============================================================ */
+
+const CORE_HEADINGS = new Set([
+  "Table of Contents",
+  "Filing at a Glance",
+  "General Information",
+  "Company and Contact",
+  "Filing Fees",
+  "State Fees",
+  "Correspondence Summary",
+  "Dispositions",
+  "Amendments",
+  "Filing Notes",
+  "Disposition",
+]);
+
+function getSectionGroup(section) {
+  const heading = cleanValue(section.heading).toLowerCase();
+
+  if (
+    heading.includes("objection") ||
+    heading.includes("response letter") ||
+    heading.includes("correspondence") ||
+    heading.includes("note to reviewer")
+  ) {
+    return "Correspondence";
+  }
+
+  if (
+    heading.includes("supporting document") ||
+    heading.includes("schedule") ||
+    heading.includes("form schedule") ||
+    heading.includes("superseded")
+  ) {
+    return "Documents";
+  }
+
+  if (CORE_HEADINGS.has(section.heading)) {
+    return "Core";
+  }
+
+  return "Core";
+}
+
+
+/* ============================================================
+   05. ATTACHED DOCUMENT LINK EXTRACTION
+   ============================================================ */
+
+function extractUrlsFromText(text) {
+  const source = normalizeText(text);
+  const matches =
+    source.match(
+      /\bhttps?:\/\/[^\s<>"')]+/gi
+    ) || [];
+
+  return [...new Set(matches)];
+}
+
+function buildDocumentLinks(result) {
+  const explicit = Array.isArray(result.document_links)
+    ? result.document_links
+    : [];
+
+  const links = [...explicit];
+
+  result.sections?.forEach((section, sectionIndex) => {
+    extractUrlsFromText(section.text).forEach((url) => {
+      links.push({
+        label: section.heading || `Document ${sectionIndex + 1}`,
+        url,
+        section_heading: section.heading,
+      });
+    });
+  });
+
+  const unique = [];
+  const seen = new Set();
+
+  links.forEach((item) => {
+    if (!item?.url) return;
+
+    const key = item.url.trim();
+    if (seen.has(key)) return;
+
+    seen.add(key);
+
+    unique.push({
+      label: item.label || "Attached document",
+      url: key,
+      section_heading: item.section_heading || "",
+      page_number: item.page_number || null,
+    });
+  });
+
+  return unique;
+}
+
+
+/* ============================================================
+   06. AUTHENTICATION - FRONTEND DEMO LAYER
+   ============================================================ */
+
+function readStoredUsers() {
+  try {
+    return JSON.parse(localStorage.getItem(USER_STORAGE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredUsers(users) {
+  localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(users));
+}
+
+function readSession() {
+  try {
+    return JSON.parse(localStorage.getItem(AUTH_STORAGE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(user) {
+  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(user));
+}
+
+function clearSession() {
+  localStorage.removeItem(AUTH_STORAGE_KEY);
+}
+
+function makeUserId() {
+  return `user_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+async function hashPassword(password) {
+  if (window.crypto?.subtle) {
+    const encoded = new TextEncoder().encode(password);
+    const buffer = await crypto.subtle.digest("SHA-256", encoded);
+    return [...new Uint8Array(buffer)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  return btoa(unescape(encodeURIComponent(password)));
+}
+
+
+/* ============================================================
+   07. ICONS
+   ============================================================ */
 
 function Icon({ name, size = 18 }) {
   const common = {
@@ -35,663 +374,739 @@ function Icon({ name, size = 18 }) {
   };
 
   const paths = {
-    menu: <><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></>,
-    home: <><path d="m3 10 9-7 9 7" /><path d="M5 9v11h14V9" /><path d="M9 20v-6h6v6" /></>,
-    file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /><path d="M9 13h6" /><path d="M9 17h6" /></>,
-    review: <><circle cx="12" cy="12" r="9" /><path d="m8.5 12 2.2 2.2 4.8-5" /></>,
-    search: <><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 5 5" /></>,
-    upload: <><path d="M12 16V4" /><path d="m7 9 5-5 5 5" /><path d="M5 20h14" /></>,
-    download: <><path d="M12 4v12" /><path d="m7 11 5 5 5-5" /><path d="M5 20h14" /></>,
-    eye: <><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></>,
-    sparkle: <><path d="m12 3 1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5Z" /><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7Z" /></>,
+    menu: (
+      <>
+        <path d="M4 6h16" />
+        <path d="M4 12h16" />
+        <path d="M4 18h16" />
+      </>
+    ),
+    search: (
+      <>
+        <circle cx="11" cy="11" r="6.5" />
+        <path d="m16 16 4 4" />
+      </>
+    ),
+    file: (
+      <>
+        <path d="M6 3.5h8l4 4V20.5H6z" />
+        <path d="M14 3.5v4h4" />
+        <path d="M9 12h6" />
+        <path d="M9 16h6" />
+      </>
+    ),
+    upload: (
+      <>
+        <path d="M12 16V4" />
+        <path d="m7 9 5-5 5 5" />
+        <path d="M5 20h14" />
+      </>
+    ),
+    download: (
+      <>
+        <path d="M12 4v12" />
+        <path d="m7 11 5 5 5-5" />
+        <path d="M5 20h14" />
+      </>
+    ),
+    arrowLeft: (
+      <>
+        <path d="M19 12H5" />
+        <path d="m11 18-6-6 6-6" />
+      </>
+    ),
+    arrowRight: (
+      <>
+        <path d="M5 12h14" />
+        <path d="m13 6 6 6-6 6" />
+      </>
+    ),
+    external: (
+      <>
+        <path d="M14 5h5v5" />
+        <path d="M10 14 19 5" />
+        <path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" />
+      </>
+    ),
+    sparkles: (
+      <>
+        <path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2z" />
+        <path d="m19 13 .7 2.3L22 16l-2.3.7L19 19l-.7-2.3L16 16l2.3-.7z" />
+      </>
+    ),
+    eye: (
+      <>
+        <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
+        <circle cx="12" cy="12" r="2.5" />
+      </>
+    ),
+    close: (
+      <>
+        <path d="m6 6 12 12" />
+        <path d="m18 6-12 12" />
+      </>
+    ),
     check: <path d="m5 12 4 4L19 6" />,
-    alert: <><path d="M12 3 22 20H2L12 3Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>,
-    close: <><path d="m6 6 12 12" /><path d="m18 6-12 12" /></>,
-    arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
-    back: <><path d="M19 12H5" /><path d="m11 18-6-6 6-6" /></>,
-    external: <><path d="M14 5h5v5" /><path d="M19 5 10 14" /><path d="M19 13v6H5V5h6" /></>,
-    lock: <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
-    user: <><circle cx="12" cy="8" r="3" /><path d="M5 21a7 7 0 0 1 14 0" /></>,
-    logout: <><path d="M10 17l5-5-5-5" /><path d="M15 12H3" /><path d="M21 4v16" /></>,
-    plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
-    refresh: <><path d="M20 11a8 8 0 0 0-14.8-4L3 9" /><path d="M3 4v5h5" /><path d="M4 13a8 8 0 0 0 14.8 4L21 15" /><path d="M21 20v-5h-5" /></>,
+    user: (
+      <>
+        <circle cx="12" cy="8" r="3" />
+        <path d="M5 20c.8-3.6 3.2-5.5 7-5.5s6.2 1.9 7 5.5" />
+      </>
+    ),
+    lock: (
+      <>
+        <rect x="5" y="10" width="14" height="10" rx="2" />
+        <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+      </>
+    ),
+    mail: (
+      <>
+        <rect x="4" y="6" width="16" height="12" rx="2" />
+        <path d="m5 8 7 5 7-5" />
+      </>
+    ),
+    logout: (
+      <>
+        <path d="M10 5H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4" />
+        <path d="M14 8l4 4-4 4" />
+        <path d="M18 12H9" />
+      </>
+    ),
   };
 
-  return <svg {...common}>{paths[name] || paths.file}</svg>;
+  return <svg {...common}>{paths[name]}</svg>;
 }
 
-function getText(section) {
-  return String(section?.text || "").trim();
-}
 
-function normalise(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function findValue(sections, labels) {
-  const joined = sections.map((s) => `${s.heading}\n${getText(s)}`).join("\n");
-  for (const label of labels) {
-    const pattern = new RegExp(`${label}\\s*[:\\-]?\\s*([^\\n]{2,120})`, "i");
-    const match = joined.match(pattern);
-    if (match?.[1]) return match[1].trim();
-  }
-  return "";
-}
-
-function buildFilingInfo(result) {
-  const sections = result?.sections || [];
-  const text = sections.map(getText).join("\n");
-  const headingText = sections.map((s) => `${s.heading}\n${getText(s)}`).join("\n");
-
-  const valueOr = (labels, fallback = "") =>
-    findValue(sections, labels) || fallback;
-
-  const info = {
-    filingCompany: valueOr(
-      ["Filing Company", "Company Name", "Filing company name"],
-      ""
-    ),
-    state: valueOr(["State", "State Name"], ""),
-    productName: valueOr(["Product Name", "Product"], ""),
-    serffTracking: valueOr(
-      ["SERFF Tracking", "SERFF Tracking #", "SERFF Tracking Number"],
-      ""
-    ),
-    filingStatus: valueOr(["Filing Status", "SERFF Status"], ""),
-    stateStatus: valueOr(["State Status"], ""),
-    submissionType: valueOr(["Submission Type"], ""),
-    toiSubToi: valueOr(["TOI / Sub-TOI", "TOI/Sub-TOI", "TOI / Sub TOI"], ""),
-    effectiveDate: valueOr(
-      ["Effective Date", "Effective Date Requested"],
-      ""
-    ),
-    receivedDate: valueOr(["Received Date", "Date Received"], ""),
-    dispositionDate: valueOr(["Disposition Date"], ""),
-  };
-
-  // Common SERFF labels are often separated by whitespace in extracted PDFs.
-  const fallbacks = [
-    ["serffTracking", /SERFF\s+Tracking\s*(?:#|Number)?\s*[:\-]?\s*([A-Z0-9\-]+)/i],
-    ["productName", /Product\s+Name\s*[:\-]?\s*([^\n]+)/i],
-    ["state", /State\s*[:\-]?\s*([^\n]+)/i],
-    ["filingStatus", /Filing\s+Status\s*[:\-]?\s*([^\n]+)/i],
-    ["stateStatus", /State\s+Status\s*[:\-]?\s*([^\n]+)/i],
-    ["submissionType", /Submission\s+Type\s*[:\-]?\s*([^\n]+)/i],
-    ["effectiveDate", /Effective\s+Date(?:\s+Requested)?\s*[:\-]?\s*([^\n]+)/i],
-    ["receivedDate", /Received\s+Date\s*[:\-]?\s*([^\n]+)/i],
-    ["dispositionDate", /Disposition\s+Date\s*[:\-]?\s*([^\n]+)/i],
-  ];
-
-  for (const [key, regex] of fallbacks) {
-    if (!info[key]) {
-      const match = headingText.match(regex);
-      if (match?.[1]) info[key] = match[1].trim();
-    }
-  }
-
-  if (!info.filingCompany) {
-    const companyMatch = text.match(
-      /(?:Filing Company|Company Name)\s*[:\-]?\s*([^\n]+)/i
-    );
-    if (companyMatch) info.filingCompany = companyMatch[1].trim();
-  }
-
-  return info;
-}
-
-function classifySection(heading) {
-  const h = normalise(heading);
-  if (
-    /correspondence|response letter|objection letter|amendment letter|note to reviewer|note to filer|disposition/.test(
-      h
-    )
-  ) {
-    return "Correspondence";
-  }
-  if (/supporting document|attachment|form|document|schedule/.test(h)) {
-    return "Documents";
-  }
-  return "Core";
-}
-
-function buildDocumentLinks(sections) {
-  const links = [];
-  const urlRegex = /https?:\/\/[^\s<>"')]+/gi;
-
-  sections.forEach((section, index) => {
-    const text = getText(section);
-    const urls = text.match(urlRegex) || [];
-    urls.forEach((url) => {
-      links.push({
-        id: `${index}-${url}`,
-        label: section.heading || "Document",
-        url,
-      });
-    });
-  });
-
-  return links;
-}
-
-function buildReviewData(result, filingInfo) {
-  const sections = result?.sections || [];
-  const found = [];
-  const missing = [];
-
-  EXPECTED_FIELDS.forEach(([key, label]) => {
-    const value = filingInfo[key];
-    if (value && normalise(value) !== "not available") {
-      found.push({ key, label, value });
-    } else {
-      missing.push({
-        key,
-        label,
-        reason: "Not identified in the extracted filing data.",
-      });
-    }
-  });
-
-  const documentLinks = buildDocumentLinks(sections);
-  const documentSections = sections.filter(
-    (section) => classifySection(section.heading) === "Documents"
-  );
-
-  return {
-    found,
-    missing,
-    documentLinks,
-    documentSections,
-    sectionCount: sections.length,
-  };
-}
+/* ============================================================
+   08. AUTH SCREEN
+   ============================================================ */
 
 function AuthScreen({ onAuthenticated }) {
   const [mode, setMode] = useState("login");
-  const [email, setEmail] = useState("");
   const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
+  const [company, setCompany] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  function switchMode(nextMode) {
-    setMode(nextMode);
-    setError("");
-  }
-
-  function submit(event) {
+  const submit = async (event) => {
     event.preventDefault();
     setError("");
 
-    if (!email.trim() || !password) {
-      setError("Enter your email and password.");
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail || !password) {
+      setError("Email and password are required.");
       return;
     }
 
-    if (mode === "signup") {
-      if (!name.trim()) {
-        setError("Enter your full name.");
-        return;
-      }
-      if (password.length < 8) {
-        setError("Password must contain at least 8 characters.");
-        return;
-      }
-      if (password !== confirmPassword) {
-        setError("Passwords do not match.");
-        return;
-      }
+    if (password.length < 6) {
+      setError("Password must contain at least 6 characters.");
+      return;
     }
 
-    const demoUser = {
-      name: name.trim() || email.split("@")[0],
-      email: email.trim(),
-      role: "Compliance Professional",
-    };
+    setLoading(true);
 
-    // Frontend-only demo authentication.
-    // No email, OTP, or authentication API is called.
-    localStorage.setItem(USER_KEY, JSON.stringify(demoUser));
-    onAuthenticated("demo-access-token", null, demoUser);
-  }
+    try {
+      const users = readStoredUsers();
 
-  const isSignup = mode === "signup";
+      if (mode === "signup") {
+        if (!name.trim()) {
+          setError("Please enter your name.");
+          return;
+        }
+
+        if (users.some((user) => user.email === normalizedEmail)) {
+          setError("An account with this email already exists.");
+          return;
+        }
+
+        const passwordHash = await hashPassword(password);
+
+        const user = {
+          id: makeUserId(),
+          name: name.trim(),
+          email: normalizedEmail,
+          company: company.trim() || "Insurance Organization",
+          passwordHash,
+          role: "Filing Analyst",
+        };
+
+        saveStoredUsers([...users, user]);
+
+        const session = {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          company: user.company,
+          role: user.role,
+        };
+
+        saveSession(session);
+        onAuthenticated(session);
+      } else {
+        const user = users.find(
+          (item) => item.email === normalizedEmail
+        );
+
+        if (!user) {
+          setError("No account was found for this email.");
+          return;
+        }
+
+        const passwordHash = await hashPassword(password);
+
+        if (user.passwordHash !== passwordHash) {
+          setError("Incorrect email or password.");
+          return;
+        }
+
+        const session = {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          company: user.company,
+          role: user.role,
+        };
+
+        saveSession(session);
+        onAuthenticated(session);
+      }
+    } catch (authError) {
+      setError(formatError(authError, "Authentication failed."));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
-    <main className="auth-screen">
-      <section className="auth-card auth-card-wide">
-        <div className="auth-brand">
-          <div className="brand-mark"><Icon name="file" size={22} /></div>
-          <div>
-            <strong>SERFF Filing Analysis</strong>
-            <span>Compliance intelligence workspace</span>
-          </div>
+    <div className="auth-shell">
+      <div className="auth-brand">
+        <div className="brand-mark">
+          <Icon name="file" size={20} />
         </div>
 
-        <div className="auth-copy">
-          <span className="eyebrow">COMPLIANCE WORKSPACE</span>
-          <h1>{isSignup ? "Create your compliance workspace." : "Sign in to review filings."}</h1>
+        <div>
+          <strong>SERFF FILING ANALYSIS</strong>
+          <span>Filing review workspace</span>
+        </div>
+      </div>
+
+      <main className="auth-main">
+        <section className="auth-intro">
+          <div className="auth-eyebrow">INSURANCE FILING WORKSPACE</div>
+
+          <h1>
+            Understand complex SERFF filings
+            <span> with confidence.</span>
+          </h1>
+
           <p>
-            {isSignup
-              ? "Create a demo account to access the filing analysis workspace."
-              : "Access structured filing data, source text, AI understanding, and review results."}
+            Extract structured filing information, review source content,
+            and use grounded AI understanding without losing the original
+            filing context.
           </p>
-        </div>
 
-        <form className="auth-form" onSubmit={submit}>
-          {isSignup && (
+          <div className="auth-points">
+            <div>
+              <Icon name="check" size={17} />
+              <span>Source-preserving PDF extraction</span>
+            </div>
+
+            <div>
+              <Icon name="check" size={17} />
+              <span>Structured filing review</span>
+            </div>
+
+            <div>
+              <Icon name="check" size={17} />
+              <span>AI grounded in extracted source text</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="auth-card">
+          <div className="auth-card-header">
+            <div>
+              <h2>
+                {mode === "login" ? "Welcome back" : "Create your account"}
+              </h2>
+
+              <p>
+                {mode === "login"
+                  ? "Sign in to continue to your filing workspace."
+                  : "Set up your filing analyst workspace."}
+              </p>
+            </div>
+          </div>
+
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={mode === "login" ? "active" : ""}
+              onClick={() => {
+                setMode("login");
+                setError("");
+              }}
+            >
+              Sign in
+            </button>
+
+            <button
+              type="button"
+              className={mode === "signup" ? "active" : ""}
+              onClick={() => {
+                setMode("signup");
+                setError("");
+              }}
+            >
+              Sign up
+            </button>
+          </div>
+
+          <form className="auth-form" onSubmit={submit}>
+            {mode === "signup" && (
+              <>
+                <label>
+                  Full name
+                  <div className="field-with-icon">
+                    <Icon name="user" size={17} />
+                    <input
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                      placeholder="Your name"
+                      autoComplete="name"
+                    />
+                  </div>
+                </label>
+
+                <label>
+                  Organization
+                  <div className="field-with-icon">
+                    <Icon name="file" size={17} />
+                    <input
+                      value={company}
+                      onChange={(event) => setCompany(event.target.value)}
+                      placeholder="Insurance organization"
+                      autoComplete="organization"
+                    />
+                  </div>
+                </label>
+              </>
+            )}
+
             <label>
-              Full name
-              <div className="input-wrap">
-                <Icon name="user" size={17} />
+              Work email
+              <div className="field-with-icon">
+                <Icon name="mail" size={17} />
                 <input
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Your full name"
-                  autoComplete="name"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="name@company.com"
+                  autoComplete="email"
                 />
               </div>
             </label>
-          )}
 
-          <label>
-            Work email
-            <div className="input-wrap">
-              <Icon name="user" size={17} />
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="name@company.com"
-                autoComplete="email"
-              />
-            </div>
-          </label>
-
-          <label>
-            Password
-            <div className="input-wrap">
-              <Icon name="lock" size={17} />
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Minimum 8 characters"
-                autoComplete={isSignup ? "new-password" : "current-password"}
-              />
-            </div>
-          </label>
-
-          {isSignup && (
             <label>
-              Confirm password
-              <div className="input-wrap">
+              Password
+              <div className="field-with-icon">
                 <Icon name="lock" size={17} />
                 <input
                   type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="Re-enter password"
-                  autoComplete="new-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="At least 6 characters"
+                  autoComplete={
+                    mode === "login" ? "current-password" : "new-password"
+                  }
                 />
               </div>
             </label>
-          )}
 
-          {error && <div className="form-error">{error}</div>}
+            {error && (
+              <div className="auth-error" role="alert">
+                {error}
+              </div>
+            )}
 
-          <button className="primary-button full-width" type="submit">
-            {isSignup ? "Create account" : "Sign in"}
-            <Icon name="arrow" size={16} />
-          </button>
+            <button
+              type="submit"
+              className="primary-button auth-submit"
+              disabled={loading}
+            >
+              {loading
+                ? "Please wait..."
+                : mode === "login"
+                ? "Sign in"
+                : "Create account"}
+            </button>
+          </form>
 
-          <button
-            type="button"
-            className="auth-switch"
-            onClick={() => switchMode(isSignup ? "login" : "signup")}
-          >
-            {isSignup
-              ? "Already have an account? Sign in"
-              : "New compliance professional? Create an account"}
-          </button>
-        </form>
-
-        <div className="auth-security">
-          <Icon name="lock" size={15} />
-          <span>Demo authentication is enabled for the frontend prototype. No email verification is required.</span>
-        </div>
-      </section>
-    </main>
-  );
-}
-
-function Sidebar({
-  screen,
-  collapsed,
-  onToggle,
-  onHome,
-  onCurrent,
-  onReview,
-  filename,
-  user,
-  onLogout,
-}) {
-  return (
-    <aside className={`app-sidebar ${collapsed ? "is-collapsed" : ""}`}>
-      <div className="sidebar-top">
-        <div className="sidebar-brand">
-          <div className="brand-mark"><Icon name="file" size={20} /></div>
-          {!collapsed && (
-            <div className="brand-copy">
-              <strong>SERFF</strong>
-              <span>Filing Workspace</span>
-            </div>
-          )}
-        </div>
-        <button className="sidebar-toggle" onClick={onToggle} aria-label="Collapse sidebar">
-          <Icon name="menu" size={18} />
-        </button>
-      </div>
-
-      <nav className="sidebar-nav">
-        <button
-          className={`nav-item ${screen === "home" ? "active" : ""}`}
-          onClick={onHome}
-          title="Home"
-        >
-          <Icon name="home" size={18} />
-          {!collapsed && <span>Home</span>}
-        </button>
-
-        <button
-          className={`nav-item ${screen === "filing" ? "active" : ""}`}
-          onClick={onCurrent}
-          title="Current Filing"
-        >
-          <Icon name="file" size={18} />
-          {!collapsed && <span>Current Filing</span>}
-        </button>
-
-        <button
-          className={`nav-item ${screen === "results" ? "active" : ""}`}
-          onClick={onReview}
-          title="Results"
-        >
-          <Icon name="review" size={18} />
-          {!collapsed && <span>Results</span>}
-        </button>
-      </nav>
-
-      <div className="sidebar-bottom">
-        {filename && !collapsed && (
-          <div className="sidebar-filing">
-            <span>CURRENT FILING</span>
-            <strong title={filename}>{filename}</strong>
-          </div>
-        )}
-
-        <button className="sidebar-user" onClick={onLogout} title="Sign out">
-          <div className="avatar">{(user?.name || "C").slice(0, 1).toUpperCase()}</div>
-          {!collapsed && (
-            <div className="user-copy">
-              <strong>{user?.name || "Compliance Professional"}</strong>
-              <span>{user?.role || "Compliance Professional"}</span>
-            </div>
-          )}
-          {!collapsed && <Icon name="logout" size={15} />}
-        </button>
-      </div>
-    </aside>
-  );
-}
-
-function HomeScreen({ onFile, loading, error }) {
-  const inputRef = useRef(null);
-  const [dragging, setDragging] = useState(false);
-
-  function chooseFile(file) {
-    if (file) onFile(file);
-  }
-
-  return (
-    <section className="page home-page">
-      <div className="page-heading">
-        <div>
-          <span className="eyebrow">FILING INTAKE</span>
-          <h1>Start a filing review</h1>
-          <p>Upload a SERFF PDF to extract structured filing information.</p>
-        </div>
-        <div className="secure-chip"><Icon name="lock" size={14} /> Secure workspace</div>
-      </div>
-
-      <div
-        className={`upload-card ${dragging ? "dragging" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragging(true);
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragging(false);
-          chooseFile(e.dataTransfer.files?.[0]);
-        }}
-      >
-        <div className="upload-icon"><Icon name="upload" size={25} /></div>
-        <h2>Upload a filing PDF</h2>
-        <p>Drag and drop a SERFF filing here, or select a document from your computer.</p>
-
-        <input
-          ref={inputRef}
-          type="file"
-          accept="application/pdf,.pdf"
-          hidden
-          onChange={(e) => chooseFile(e.target.files?.[0])}
-        />
-
-        <button
-          className="primary-button"
-          onClick={() => inputRef.current?.click()}
-          disabled={loading}
-        >
-          {loading ? "Extracting filing..." : "Select PDF"}
-          {!loading && <Icon name="arrow" size={16} />}
-        </button>
-
-        <div className="upload-note">
-          <Icon name="check" size={15} />
-          <span>PDF only · Source text is preserved for traceability</span>
-        </div>
-      </div>
-
-      {error && (
-        <div className="error-banner">
-          <Icon name="alert" size={17} />
-          <div>
-            <strong>Extraction failed</strong>
-            <span>{error}</span>
-          </div>
-        </div>
-      )}
-
-      <div className="home-features">
-        <div><Icon name="file" size={17} /><span><strong>Structured extraction</strong>Headings and body text are separated.</span></div>
-        <div><Icon name="search" size={17} /><span><strong>Fast navigation</strong>Search across extracted sections.</span></div>
-        <div><Icon name="review" size={17} /><span><strong>Review results</strong>See found and missing filing details.</span></div>
-      </div>
-    </section>
-  );
-}
-
-function FilingHeader({ result, onNew, onExport, onOriginal }) {
-  function exportJson() {
-    const blob = new Blob([JSON.stringify(result, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${result.filename || "filing"}-extraction.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    onExport?.();
-  }
-
-  return (
-    <div className="filing-header">
-      <div className="filing-heading">
-        <div className="file-avatar"><Icon name="file" size={20} /></div>
-        <div>
-          <span className="eyebrow">CURRENT FILING</span>
-          <h1>{result.filename}</h1>
-          <p>{result.page_count || "—"} pages · {result.section_count || result.sections?.length || 0} sections extracted</p>
-        </div>
-      </div>
-
-      <div className="header-actions">
-        <button className="secondary-button" onClick={onNew}>
-          <Icon name="back" size={16} /> New filing
-        </button>
-        <button className="secondary-button" onClick={onOriginal}>
-          <Icon name="eye" size={16} /> View original
-        </button>
-        <button className="primary-button" onClick={exportJson}>
-          <Icon name="download" size={16} /> Export JSON
-        </button>
-      </div>
+          <p className="auth-footnote">
+            Demo authentication is stored locally in this browser. Connect
+            these actions to the production auth API before deployment.
+          </p>
+        </section>
+      </main>
     </div>
   );
 }
 
-function FilingInformation({ info, pageCount }) {
-  const items = [
-    ["Filing company", info.filingCompany],
+
+/* ============================================================
+   09. UPLOAD SCREEN
+   ============================================================ */
+
+function UploadScreen({ user, onFileSelected, error }) {
+  const inputRef = useRef(null);
+  const [dragActive, setDragActive] = useState(false);
+
+  const chooseFile = () => inputRef.current?.click();
+
+  const acceptFile = (file) => {
+    if (!file) return;
+    onFileSelected(file);
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setDragActive(false);
+
+    const file = event.dataTransfer.files?.[0];
+    acceptFile(file);
+  };
+
+  return (
+    <div className="upload-workspace">
+      <header className="upload-topbar">
+        <div className="brand-block">
+          <div className="brand-mark">
+            <Icon name="file" size={20} />
+          </div>
+
+          <div>
+            <strong>SERFF FILING ANALYSIS</strong>
+            <span>Secure filing review workspace</span>
+          </div>
+        </div>
+
+        <div className="user-menu-static">
+          <div className="avatar">{user.name?.charAt(0)?.toUpperCase()}</div>
+          <div>
+            <strong>{user.name}</strong>
+            <span>{user.role}</span>
+          </div>
+        </div>
+      </header>
+
+      <main className="upload-main">
+        <section className="upload-hero">
+          <div className="upload-eyebrow">FILING REVIEW WORKSPACE</div>
+
+          <h1>Extract SERFF filings with ease</h1>
+
+          <p>
+            Upload a filing PDF and turn its contents into structured,
+            searchable information for review.
+          </p>
+        </section>
+
+        <section
+          className={`upload-dropzone ${dragActive ? "drag-active" : ""}`}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={() => setDragActive(false)}
+          onDrop={handleDrop}
+          onClick={chooseFile}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              chooseFile();
+            }
+          }}
+        >
+          <input
+            ref={inputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            hidden
+            onChange={(event) => acceptFile(event.target.files?.[0])}
+          />
+
+          <div className="upload-icon">
+            <Icon name="upload" size={34} />
+          </div>
+
+          <h2>Drop your SERFF filing here</h2>
+
+          <p>
+            Drag and drop a PDF into this area, or choose one from your
+            computer.
+          </p>
+
+          <div className="upload-action-row">
+            <button
+              type="button"
+              className="primary-button upload-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                chooseFile();
+              }}
+            >
+              <Icon name="upload" size={17} />
+              Choose PDF
+            </button>
+
+            <span>PDF files only</span>
+          </div>
+
+          {error && <div className="upload-error">{error}</div>}
+        </section>
+
+        <section className="upload-capabilities">
+          <div className="capability-card">
+            <span className="capability-number">01</span>
+            <strong>Fast extraction</strong>
+            <p>Structured filing data in seconds.</p>
+          </div>
+
+          <div className="capability-card">
+            <span className="capability-number">02</span>
+            <strong>Source-preserving</strong>
+            <p>Content is extracted without rewriting.</p>
+          </div>
+
+          <div className="capability-card">
+            <span className="capability-number">03</span>
+            <strong>Machine-readable</strong>
+            <p>The same result is available as JSON.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+
+/* ============================================================
+   10. TOP APPLICATION BAR
+   ============================================================ */
+
+function AppTopbar({ user, search, onSearch, onLogout, onMenu }) {
+  return (
+    <header className="app-topbar">
+      <div className="topbar-left">
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onMenu}
+          aria-label="Toggle navigation"
+        >
+          <Icon name="menu" size={18} />
+        </button>
+
+        <div className="topbar-brand">
+          <strong>SERFF FILING ANALYSIS</strong>
+          <span>Structured filing review workspace</span>
+        </div>
+      </div>
+
+      <div className="topbar-right">
+        <div className="global-search">
+          <Icon name="search" size={16} />
+          <input
+            value={search}
+            onChange={(event) => onSearch(event.target.value)}
+            placeholder="Search sections or keywords..."
+            aria-label="Search filing"
+          />
+        </div>
+
+        <div className="topbar-user">
+          <div className="avatar">
+            {user.name?.charAt(0)?.toUpperCase()}
+          </div>
+
+          <div className="topbar-user-text">
+            <strong>{user.name}</strong>
+            <span>{user.role}</span>
+          </div>
+
+          <button
+            type="button"
+            className="logout-button"
+            onClick={onLogout}
+            title="Sign out"
+          >
+            <Icon name="logout" size={16} />
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+
+/* ============================================================
+   11. FILING INFORMATION PANEL
+   ============================================================ */
+
+function FilingInformation({ info }) {
+  const rows = [
+    ["Filing", info.filing],
+    ["Main actor", info.mainActor],
     ["State", info.state],
-    ["Product name", info.productName],
-    ["SERFF tracking", info.serffTracking],
+    ["Product", info.product],
+    ["SERFF Tracking", info.serffTracking],
     ["Filing status", info.filingStatus],
     ["State status", info.stateStatus],
     ["Submission type", info.submissionType],
-    ["TOI / Sub-TOI", info.toiSubToi],
+    [
+      "TOI / Sub-TOI",
+      `${info.toi} / ${info.subToi}`,
+    ],
     ["Effective date", info.effectiveDate],
     ["Received date", info.receivedDate],
     ["Disposition date", info.dispositionDate],
   ];
 
   return (
-    <section className="panel filing-info-panel">
+    <section className="panel filing-panel">
       <div className="panel-header">
         <div>
-          <span className="eyebrow">FILING INFORMATION</span>
-          <h2>At a glance</h2>
+          <div className="panel-eyebrow">FILING</div>
+          <h2>Filing Information</h2>
+          <p>Key information identified from the filing.</p>
         </div>
-        <span className="status-badge"><span /> Extracted</span>
+
+        <span className="status-pill">
+          <span />
+          Completed
+        </span>
       </div>
 
-      <div className="panel-scroll">
-        <div className="info-grid">
-          {items.map(([label, value]) => (
-            <div className="info-cell" key={label}>
-              <span>{label}</span>
-              <strong className={!value ? "missing-value" : ""}>
-                {value || "Not available"}
-              </strong>
-            </div>
-          ))}
-          <div className="info-cell">
-            <span>Document size</span>
-            <strong>{pageCount || "—"} pages</strong>
+      <div className="panel-scroll filing-scroll">
+        {rows.map(([label, value]) => (
+          <div className="info-row" key={label}>
+            <span>{label}</span>
+            <strong>{value}</strong>
           </div>
-        </div>
+        ))}
       </div>
     </section>
   );
 }
 
-function SectionList({ sections, selectedId, onSelect }) {
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState("All");
 
-  const filtered = useMemo(() => {
-    const q = normalise(query);
+/* ============================================================
+   12. SECTION TABS
+   ============================================================ */
+
+function SectionTabs({ activeTab, onTabChange }) {
+  const tabs = ["All", "Core", "Correspondence", "Documents"];
+
+  return (
+    <div className="section-tabs">
+      {tabs.map((tab) => (
+        <button
+          type="button"
+          key={tab}
+          className={activeTab === tab ? "active" : ""}
+          onClick={() => onTabChange(tab)}
+        >
+          {tab}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+
+/* ============================================================
+   13. SECTION NAVIGATION PANEL
+   ============================================================ */
+
+function SectionsPanel({
+  sections,
+  activeSectionId,
+  onSectionClick,
+  search,
+  onSearchChange,
+}) {
+  const filteredSections = useMemo(() => {
+    const query = cleanValue(search).toLowerCase();
+
+    if (!query) return sections;
+
     return sections.filter((section) => {
-      const group = classifySection(section.heading);
-      const matchesFilter = filter === "All" || group === filter;
-      const matchesQuery =
-        !q ||
-        normalise(section.heading).includes(q) ||
-        normalise(getText(section)).includes(q);
-      return matchesFilter && matchesQuery;
+      const haystack =
+        `${section.heading} ${section.text}`.toLowerCase();
+
+      return haystack.includes(query);
     });
-  }, [sections, query, filter]);
+  }, [sections, search]);
 
   return (
     <section className="panel sections-panel">
-      <div className="panel-header">
+      <div className="panel-header compact">
         <div>
-          <span className="eyebrow">NAVIGATION</span>
-          <h2>Extracted sections</h2>
+          <div className="panel-eyebrow">NAVIGATION</div>
+          <h2>Sections</h2>
+          <p>Navigate the structured filing data.</p>
         </div>
+
         <span className="count-pill">{sections.length}</span>
       </div>
 
-      <div className="section-toolbar">
-        <div className="search-input">
-          <Icon name="search" size={16} />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search sections..."
-          />
-        </div>
-
-        <div className="filter-tabs">
-          {["All", "Core", "Correspondence", "Documents"].map((item) => (
-            <button
-              key={item}
-              className={filter === item ? "active" : ""}
-              onClick={() => setFilter(item)}
-            >
-              {item}
-            </button>
-          ))}
-        </div>
+      <div className="section-search">
+        <Icon name="search" size={16} />
+        <input
+          value={search}
+          onChange={(event) => onSearchChange(event.target.value)}
+          placeholder="Search sections..."
+        />
       </div>
 
-      <div className="panel-scroll section-scroll">
-        {filtered.length === 0 ? (
-          <div className="empty-panel">
-            <Icon name="search" size={20} />
+      <div className="panel-scroll section-list-scroll">
+        {filteredSections.length === 0 ? (
+          <div className="empty-state compact-empty">
             <strong>No matching sections</strong>
             <span>Try a different search term.</span>
           </div>
         ) : (
           <div className="section-list">
-            {filtered.map((section) => {
-              const id = section.id ?? section.original_index;
-              const selected = id === selectedId;
-              return (
-                <button
-                  key={id}
-                  className={`section-item ${selected ? "selected" : ""}`}
-                  onClick={() => onSelect(section, id)}
-                >
-                  <span className="section-number">
-                    {String((section.original_index ?? sections.indexOf(section) + 1) + 1).padStart(2, "0")}
-                  </span>
-                  <span className="section-copy">
-                    <strong>{section.heading || "Untitled section"}</strong>
-                    <small>
-                      {classifySection(section.heading)} ·{" "}
-                      {getText(section)
-                        ? `${getText(section).length.toLocaleString()} characters`
-                        : "No extracted text"}
-                    </small>
-                  </span>
-                  <Icon name="arrow" size={15} />
-                </button>
-              );
-            })}
+            {filteredSections.map((section) => (
+              <button
+                type="button"
+                className={`section-list-item ${
+                  activeSectionId === section.id ? "active" : ""
+                }`}
+                key={section.id}
+                onClick={() => onSectionClick(section.id)}
+              >
+                <span className="section-number">
+                  {section.id + 1}
+                </span>
+
+                <span className="section-item-copy">
+                  <strong>{section.heading}</strong>
+
+                  <small>
+                    {cleanValue(section.text).slice(0, 110) ||
+                      "No extracted text available."}
+                  </small>
+                </span>
+
+                <Icon name="arrowRight" size={15} />
+              </button>
+            ))}
           </div>
         )}
       </div>
@@ -699,580 +1114,1402 @@ function SectionList({ sections, selectedId, onSelect }) {
   );
 }
 
-function SectionViewer({
-  section,
-  ai,
-  aiLoading,
-  aiError,
-  onUnderstand,
-  onResetAi,
-}) {
-  const [sourceMode, setSourceMode] = useState(true);
 
-  useEffect(() => {
-    setSourceMode(true);
-  }, [section]);
+/* ============================================================
+   14. DOCUMENTS PANEL
+   ============================================================ */
 
+function DocumentsPanel({ links, onOpenPdf }) {
   return (
-    <section className="panel core-panel">
-      <div className="panel-header selected-header">
-        <div className="selected-title">
-          <span className="eyebrow">SELECTED SECTION</span>
-          <h2>{section?.heading || "No section selected"}</h2>
-          <p>{classifySection(section?.heading)} · Source-grounded view</p>
+    <section className="panel documents-panel">
+      <div className="panel-header compact">
+        <div>
+          <div className="panel-eyebrow">DOCUMENTS</div>
+          <h2>Attached documents</h2>
+          <p>Links identified from the filing source.</p>
         </div>
 
-        <div className="viewer-actions">
-          {ai && (
+        <span className="count-pill">{links.length}</span>
+      </div>
+
+      <div className="panel-scroll documents-scroll">
+        <button
+          type="button"
+          className="document-card original-pdf-card"
+          onClick={onOpenPdf}
+        >
+          <span className="document-icon">
+            <Icon name="file" size={17} />
+          </span>
+
+          <span className="document-copy">
+            <strong>Original PDF</strong>
+            <small>Open the uploaded filing source.</small>
+          </span>
+
+          <Icon name="external" size={15} />
+        </button>
+
+        {links.length === 0 ? (
+          <div className="empty-state">
+            <strong>No attached links detected</strong>
+            <span>
+              PDF link annotations can be added to the backend extraction
+              contract later.
+            </span>
+          </div>
+        ) : (
+          <div className="document-list">
+            {links.map((document, index) => (
+              <a
+                key={`${document.url}-${index}`}
+                href={document.url}
+                target="_blank"
+                rel="noreferrer"
+                className="document-card"
+              >
+                <span className="document-icon">
+                  <Icon name="external" size={16} />
+                </span>
+
+                <span className="document-copy">
+                  <strong>{document.label}</strong>
+                  <small>
+                    {document.section_heading ||
+                      "Attached document"}
+                    {document.page_number
+                      ? ` · Page ${document.page_number}`
+                      : ""}
+                  </small>
+                </span>
+
+                <Icon name="arrowRight" size={15} />
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+
+/* ============================================================
+   15. SELECTED SECTION CONTENT
+   ============================================================ */
+
+function KeyInformationTable({ items }) {
+  if (!items?.length) return null;
+
+  return (
+    <div className="ai-block">
+      <h3>Key Information</h3>
+
+      <div className="key-info-table">
+        {items.map((item, index) => (
+          <div className="key-info-row" key={`${item.label}-${index}`}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ImportantPoints({ points }) {
+  if (!points?.length) return null;
+
+  return (
+    <div className="ai-block">
+      <h3>Important Points</h3>
+
+      <ul className="important-points">
+        {points.map((point, index) => (
+          <li key={`${point}-${index}`}>
+            <span>
+              <Icon name="check" size={13} />
+            </span>
+            <p>{point}</p>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SourceText({ text }) {
+  if (!cleanValue(text)) {
+    return (
+      <div className="empty-source">
+        No extracted text is available for this section.
+      </div>
+    );
+  }
+
+  return <pre className="source-text">{normalizeText(text)}</pre>;
+}
+
+function SelectedSectionPanel({
+  section,
+  aiState,
+  onUnderstand,
+  onRefresh,
+  onViewSource,
+  showingSource,
+}) {
+  if (!section) {
+    return (
+      <section className="panel selected-panel">
+        <div className="empty-state large-empty">
+          <strong>Select a section</strong>
+          <span>Choose a section from the navigation panel.</span>
+        </div>
+      </section>
+    );
+  }
+
+  const aiData = aiState?.data;
+  const aiLoading = aiState?.loading;
+  const aiError = aiState?.error;
+
+  return (
+    <section className="panel selected-panel">
+      <div className="selected-header">
+        <div>
+          <div className="panel-eyebrow">SELECTED SECTION</div>
+          <h2>{section.heading}</h2>
+          <p>Section {section.id + 1} of the filing</p>
+        </div>
+
+        <div className="selected-actions">
+          {aiData && (
             <button
-              className={`secondary-button compact ${sourceMode ? "active" : ""}`}
-              onClick={() => setSourceMode(true)}
+              type="button"
+              className="secondary-button"
+              onClick={onViewSource}
             >
-              Source
+              <Icon name="eye" size={15} />
+              {showingSource ? "View AI" : "View source"}
             </button>
           )}
-          {ai && (
-            <button
-              className={`secondary-button compact ${!sourceMode ? "active" : ""}`}
-              onClick={() => setSourceMode(false)}
-            >
-              AI view
-            </button>
-          )}
+
           <button
-            className="primary-button compact"
-            onClick={async () => {
-              const success = await onUnderstand();
-              if (success) setSourceMode(false);
-            }}
-            disabled={aiLoading}
+            type="button"
+            className="primary-button"
+            onClick={aiData ? onRefresh : onUnderstand}
+            disabled={aiLoading || !cleanValue(section.text)}
           >
-            <Icon name={aiLoading ? "refresh" : "sparkle"} size={15} />
-            {aiLoading ? "Understanding..." : ai ? "Refresh AI" : "Understand with AI"}
+            <Icon name="sparkles" size={16} />
+            {aiLoading
+              ? "Understanding..."
+              : aiData
+              ? "Refresh AI"
+              : "Understand with AI"}
           </button>
         </div>
       </div>
 
-      <div className="viewer-scroll">
-        {aiError && (
-          <div className="error-card">
-            <Icon name="alert" size={18} />
-            <div>
-              <strong>AI understanding failed</strong>
-              <span>{aiError}</span>
+      <div className="selected-content-scroll">
+        {aiLoading ? (
+          <div className="ai-loading">
+            <div className="loading-orbit">
+              <span />
+              <span />
+              <span />
             </div>
+
+            <strong>Understanding this section...</strong>
+
+            <p>
+              AI is working only from the extracted source text.
+            </p>
+          </div>
+        ) : aiError ? (
+          <div className="ai-error-card">
+            <strong>AI understanding failed</strong>
+            <p>{aiError}</p>
+
             <button
-              className="secondary-button compact"
-              onClick={async () => {
-                const success = await onUnderstand();
-                if (success) setSourceMode(false);
-              }}
+              type="button"
+              className="secondary-button"
+              onClick={onUnderstand}
             >
               Try again
             </button>
           </div>
-        )}
-
-        {!ai || sourceMode ? (
-          <div className="source-view">
-            <div className="source-banner">
-              <div>
-                <span className="eyebrow">ORIGINAL EXTRACTED SOURCE</span>
-                <p>This is the structured text returned by the extraction pipeline.</p>
-              </div>
-              <span>{getText(section).length.toLocaleString()} chars</span>
+        ) : aiData && !showingSource ? (
+          <div className="ai-content">
+            <div className="ai-label">
+              <Icon name="sparkles" size={14} />
+              AI Understanding
             </div>
-            <pre className="source-text">{getText(section) || "No extracted text available."}</pre>
+
+            <p className="ai-grounding">
+              Based only on the extracted source text.
+            </p>
+
+            <div className="ai-block">
+              <h3>Overview</h3>
+              <p className="overview-text">{aiData.overview}</p>
+            </div>
+
+            <KeyInformationTable items={aiData.key_information} />
+
+            <ImportantPoints points={aiData.important_points} />
           </div>
         ) : (
-          <AIView ai={ai} />
+          <div className="source-content">
+            <div className="source-label">
+              Original extracted source
+            </div>
+
+            <p className="source-grounding">
+              This is the exact structured text returned by the extraction
+              pipeline for this section.
+            </p>
+
+            <SourceText text={section.text} />
+          </div>
         )}
       </div>
     </section>
   );
 }
 
-function AIView({ ai }) {
-  return (
-    <div className="ai-view">
-      <div className="ai-overview">
-        <span className="eyebrow">AI-GENERATED UNDERSTANDING</span>
-        <h3>{ai.heading || "Section understanding"}</h3>
-        <p>{ai.overview || "No overview returned."}</p>
-      </div>
 
-      {ai.key_information?.length > 0 && (
-        <div className="ai-block">
-          <div className="ai-block-heading"><strong>Key information</strong></div>
-          <div className="key-grid">
-            {ai.key_information.map((item, index) => (
-              <div className="key-cell" key={`${item.label}-${index}`}>
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+/* ============================================================
+   16. ORIGINAL PDF MODAL
+   ============================================================ */
 
-      {ai.important_points?.length > 0 && (
-        <div className="ai-block">
-          <div className="ai-block-heading"><strong>Important points</strong></div>
-          <ul className="important-list">
-            {ai.important_points.map((point, index) => (
-              <li key={index}><Icon name="check" size={15} /><span>{point}</span></li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ReviewScreen({ result, filingInfo, onBackToFiling }) {
-  const review = useMemo(
-    () => buildReviewData(result, filingInfo),
-    [result, filingInfo]
-  );
+function PdfViewerModal({
+  file,
+  pdfUrl,
+  isOpen,
+  onClose,
+}) {
+  // The original PDF must NEVER open automatically.
+  // It is rendered only after the user explicitly clicks
+  // "View original PDF" or the Documents-panel PDF action.
+  if (!isOpen || !pdfUrl) return null;
 
   return (
-    <section className="page review-page">
-      <div className="page-heading review-heading">
-        <div>
-          <span className="eyebrow">REVIEW RESULTS</span>
-          <h1>Filing completeness review</h1>
-          <p>
-            A structured inventory of information found in the extracted filing.
-            Missing means <strong>not identified in the extracted data</strong> and
-            should be verified by a compliance professional.
-          </p>
-        </div>
-        <button className="secondary-button" onClick={onBackToFiling}>
-          <Icon name="back" size={16} /> Current filing
-        </button>
-      </div>
-
-      <div className="review-summary">
-        <div className="summary-card found">
-          <div className="summary-icon"><Icon name="check" size={20} /></div>
-          <div><span>Found details</span><strong>{review.found.length}</strong></div>
-          <small>Fields identified in extracted text</small>
-        </div>
-        <div className="summary-card missing">
-          <div className="summary-icon"><Icon name="alert" size={20} /></div>
-          <div><span>Needs verification</span><strong>{review.missing.length}</strong></div>
-          <small>Fields not identified by the extractor</small>
-        </div>
-        <div className="summary-card docs">
-          <div className="summary-icon"><Icon name="file" size={20} /></div>
-          <div><span>Document references</span><strong>{review.documentLinks.length}</strong></div>
-          <small>Explicit links found in extracted text</small>
-        </div>
-      </div>
-
-      <div className="review-grid">
-        <section className="panel review-panel">
-          <div className="panel-header">
-            <div>
-              <span className="eyebrow">FOUND</span>
-              <h2>Identified filing details</h2>
-            </div>
-            <span className="status-badge"><span /> Verified from extraction</span>
-          </div>
-
-          <div className="review-list-scroll">
-            {review.found.map((item) => (
-              <div className="review-row found-row" key={item.key}>
-                <div className="review-row-icon"><Icon name="check" size={15} /></div>
-                <div>
-                  <span>{item.label}</span>
-                  <strong>{item.value}</strong>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="panel review-panel">
-          <div className="panel-header">
-            <div>
-              <span className="eyebrow">NOT IDENTIFIED</span>
-              <h2>Details requiring verification</h2>
-            </div>
-            <span className="warning-badge"><Icon name="alert" size={13} /> Review</span>
-          </div>
-
-          <div className="review-list-scroll">
-            {review.missing.map((item) => (
-              <div className="review-row missing-row" key={item.key}>
-                <div className="review-row-icon"><Icon name="alert" size={15} /></div>
-                <div>
-                  <span>{item.label}</span>
-                  <strong>Not identified</strong>
-                  <small>{item.reason}</small>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      </div>
-
-      <section className="panel documents-review-panel">
-        <div className="panel-header">
-          <div>
-            <span className="eyebrow">FILES & REFERENCES</span>
-            <h2>Document references detected</h2>
-            <p>
-              This list shows document/link references visible to the extractor.
-              It does not prove that an attachment is physically present or absent.
-            </p>
-          </div>
-        </div>
-
-        <div className="document-review-list">
-          {review.documentLinks.length > 0 ? (
-            review.documentLinks.map((item) => (
-              <a
-                className="document-row"
-                href={item.url}
-                target="_blank"
-                rel="noreferrer"
-                key={item.id}
-              >
-                <div className="document-row-icon"><Icon name="file" size={17} /></div>
-                <div>
-                  <strong>{item.label}</strong>
-                  <span>{item.url}</span>
-                </div>
-                <Icon name="external" size={16} />
-              </a>
-            ))
-          ) : (
-            <div className="empty-document-state">
-              <Icon name="file" size={19} />
-              <div>
-                <strong>No explicit document links detected</strong>
-                <span>This is not the same as confirming that the filing has no attachments.</span>
-              </div>
-            </div>
-          )}
-        </div>
-      </section>
-    </section>
-  );
-}
-
-function PDFModal({ open, url, filename, onClose }) {
-  if (!open || !url) return null;
-
-  return (
-    <div className="modal-backdrop" onMouseDown={onClose}>
-      <div className="pdf-modal" onMouseDown={(e) => e.stopPropagation()}>
+    <div
+      className="pdf-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Original PDF viewer"
+    >
+      <div className="pdf-modal">
         <div className="pdf-modal-header">
           <div>
-            <span className="eyebrow">SOURCE DOCUMENT</span>
-            <strong>{filename}</strong>
+            <div className="panel-eyebrow">ORIGINAL DOCUMENT</div>
+            <h2>{file?.name || "Original filing.pdf"}</h2>
+            <p>Original uploaded PDF · source of truth</p>
           </div>
-          <button className="icon-button" onClick={onClose}><Icon name="close" size={18} /></button>
+
+          <div className="pdf-modal-actions">
+            <a
+              href={pdfUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="secondary-button"
+            >
+              <Icon name="external" size={15} />
+              Open in new tab
+            </a>
+
+            <button
+              type="button"
+              className="icon-button"
+              onClick={onClose}
+              aria-label="Close PDF viewer"
+            >
+              <Icon name="close" size={19} />
+            </button>
+          </div>
         </div>
-        <iframe title={filename} src={url} />
+
+        <div className="pdf-modal-body">
+          <iframe
+            key={pdfUrl}
+            src={pdfUrl}
+            title="Original uploaded PDF"
+            className="pdf-frame"
+          />
+        </div>
       </div>
     </div>
   );
 }
 
-export default function App() {
-  const [user, setUser] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem(USER_KEY) || "null");
-    } catch {
-      return null;
-    }
-  });
-  const [accessToken, setAccessToken] = useState("");
-  const [authRestoring, setAuthRestoring] = useState(false);
 
-  const [screen, setScreen] = useState(() =>
-    localStorage.getItem(LAST_RESULT_KEY) ? "filing" : "home"
+/* ============================================================
+   17. LIVE FILING REVIEW
+   ============================================================ */
+
+function buildReviewReport(result) {
+  const glance = findSectionText(result, "Filing at a Glance");
+  const general = findSectionText(result, "General Information");
+  const company = findSectionText(result, "Company and Contact");
+  const allText = normalizeText(
+    (result.sections || []).map((section) => section.text || "").join("\n")
   );
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [result, setResult] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem(LAST_RESULT_KEY) || "null");
-    } catch {
-      return null;
+
+  const getGlance = (label) =>
+    findExactField(glance, label, FILING_GLANCE_LABELS);
+
+  const checks = [
+    {
+      key: "company",
+      label: "Filing company",
+      value: getGlance("Company"),
+      source: "Filing at a Glance",
+      category: "Filing identity",
+    },
+    {
+      key: "state",
+      label: "State",
+      value: getGlance("State"),
+      source: "Filing at a Glance",
+      category: "Filing identity",
+    },
+    {
+      key: "product",
+      label: "Product name",
+      value: getGlance("Product Name"),
+      source: "Filing at a Glance",
+      category: "Filing identity",
+    },
+    {
+      key: "serff",
+      label: "SERFF tracking number",
+      value: getGlance("SERFF Tr Num"),
+      source: "Filing at a Glance",
+      category: "Filing identity",
+    },
+    {
+      key: "filing-status",
+      label: "SERFF filing status",
+      value: getGlance("SERFF Status"),
+      source: "Filing at a Glance",
+      category: "Workflow",
+    },
+    {
+      key: "state-status",
+      label: "State status",
+      value: getGlance("State Status"),
+      source: "Filing at a Glance",
+      category: "Workflow",
+    },
+    {
+      key: "submission",
+      label: "Submission type",
+      value: firstNonEmpty(
+        findExactField(general, "Submission Type", GENERAL_LABELS),
+        findExactField(company, "Submission Type", COMPANY_LABELS)
+      ),
+      source: "General Information / Company and Contact",
+      category: "Filing setup",
+    },
+    {
+      key: "toi",
+      label: "TOI / Sub-TOI",
+      value: [
+        getGlance("TOI"),
+        getGlance("Sub-TOI"),
+      ].filter(Boolean).join(" / "),
+      source: "Filing at a Glance",
+      category: "Filing setup",
+    },
+    {
+      key: "submitted",
+      label: "Date submitted",
+      value: getGlance("Date Submitted"),
+      source: "Filing at a Glance",
+      category: "Dates",
+    },
+    {
+      key: "effective-requested",
+      label: "Effective date requested",
+      value: getGlance("Effective Date Requested"),
+      source: "Filing at a Glance",
+      category: "Dates",
+    },
+    {
+      key: "effective",
+      label: "Effective date",
+      value: getGlance("Effective Date"),
+      source: "Filing at a Glance",
+      category: "Dates",
+      reviewIf: (value) =>
+        Boolean(value) && !isRealDate(value) && value.toLowerCase() !== "not available",
+    },
+    {
+      key: "disposition-date",
+      label: "Disposition date",
+      value: getGlance("Disposition Date"),
+      source: "Filing at a Glance",
+      category: "Dates",
+    },
+    {
+      key: "disposition-status",
+      label: "Disposition status",
+      value: getGlance("Disposition Status"),
+      source: "Filing at a Glance",
+      category: "Workflow",
+    },
+  ];
+
+  const normalizedChecks = checks.map((item) => {
+    const value = cleanValue(item.value);
+    let status = "missing";
+
+    if (value) {
+      status = item.reviewIf?.(value) ? "review" : "found";
     }
+
+    return {
+      ...item,
+      value: value || "Not found in extracted text",
+      status,
+    };
   });
-  const [pdfUrl, setPdfUrl] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [extractError, setExtractError] = useState("");
-  const [selectedId, setSelectedId] = useState(null);
-  const [ai, setAi] = useState(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState("");
-  const [pdfOpen, setPdfOpen] = useState(false);
 
-  const sections = result?.sections || [];
-  const selectedSection =
-    sections.find((section, index) => (section.id ?? index) === selectedId) ||
-    sections[0] ||
-    null;
+  const sections = result.sections || [];
+  const headings = sections.map((section) => cleanValue(section.heading).toLowerCase());
+  const lowerText = allText.toLowerCase();
 
-  useEffect(() => {
-    if (result && sections.length && selectedId === null) {
-      setSelectedId(sections[0].id ?? 0);
-    }
-  }, [result, sections, selectedId]);
+  const documentChecks = [
+    {
+      key: "supporting-schedule",
+      label: "Supporting document schedule",
+      description: "A section or extracted text referring to supporting documents.",
+      found:
+        headings.some((heading) => heading.includes("supporting document")) ||
+        lowerText.includes("supporting document"),
+      evidence:
+        sections.find((section) =>
+          cleanValue(section.heading).toLowerCase().includes("supporting document")
+        )?.heading || "No supporting-document section detected",
+    },
+    {
+      key: "attachments",
+      label: "Attachments / attached documents",
+      description: "Attachment references detected in the extracted filing text.",
+      found: lowerText.includes("attachment"),
+      evidence: lowerText.includes("attachment")
+        ? "Attachment reference found in extracted text"
+        : "No attachment reference detected",
+    },
+    {
+      key: "document-links",
+      label: "Document links",
+      description: "Explicit web/document links detected in the filing.",
+      found: buildDocumentLinks(result).length > 0,
+      evidence: `${buildDocumentLinks(result).length} link${
+        buildDocumentLinks(result).length === 1 ? "" : "s"
+      } detected`,
+    },
+    {
+      key: "correspondence",
+      label: "Correspondence / response material",
+      description: "Objection, response, disposition or reviewer correspondence sections.",
+      found: sections.some((section) => getSectionGroup(section) === "Correspondence"),
+      evidence: `${
+        sections.filter((section) => getSectionGroup(section) === "Correspondence").length
+      } correspondence section${
+        sections.filter((section) => getSectionGroup(section) === "Correspondence").length === 1
+          ? ""
+          : "s"
+      } detected`,
+    },
+  ];
 
-  function handleAuthenticated(token, _refreshToken, authenticatedUser) {
-    setAccessToken(token);
-    setUser(authenticatedUser);
-    localStorage.setItem(USER_KEY, JSON.stringify(authenticatedUser));
-    setScreen(localStorage.getItem(LAST_RESULT_KEY) ? "filing" : "home");
-  }
+  const foundCount = normalizedChecks.filter((item) => item.status === "found").length;
+  const reviewCount = normalizedChecks.filter((item) => item.status === "review").length;
+  const missingCount = normalizedChecks.filter((item) => item.status === "missing").length;
+  const documentsFound = documentChecks.filter((item) => item.found).length;
 
-  function resetWorkspace() {
-    setResult(null);
-    setSelectedId(null);
-    setAi(null);
-    setAiError("");
-    setExtractError("");
-    setPdfOpen(false);
-    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
-    setPdfUrl(null);
-    localStorage.removeItem(LAST_RESULT_KEY);
-    setScreen("home");
-  }
+  return {
+    checks: normalizedChecks,
+    documentChecks,
+    counts: {
+      found: foundCount,
+      review: reviewCount,
+      missing: missingCount,
+      documentsFound,
+      total: normalizedChecks.length,
+    },
+  };
+}
 
-  async function handleFile(file) {
-    if (!file) return;
+function ReviewStatusBadge({ status }) {
+  const config = {
+    found: { label: "Found", icon: "check" },
+    review: { label: "Needs review", icon: "eye" },
+    missing: { label: "Missing", icon: "close" },
+  };
 
-    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-      setExtractError("Please select a PDF filing.");
-      return;
-    }
+  const item = config[status] || config.missing;
 
-    setLoading(true);
-    setExtractError("");
-    setAi(null);
+  return (
+    <span className={`review-status review-status-${status}`}>
+      <Icon name={item.icon} size={13} />
+      {item.label}
+    </span>
+  );
+}
 
-    const localUrl = URL.createObjectURL(file);
-    setPdfUrl(localUrl);
+function ReviewScreen({ result, onGoToFiling, onGoHome }) {
+  const hasFiling = Boolean(result?.filename);
+  const report = useMemo(
+    () => (hasFiling ? buildReviewReport(result) : null),
+    [result, hasFiling]
+  );
 
-    try {
-      const form = new FormData();
-      form.append("file", file);
+  const [filter, setFilter] = useState("all");
+  const [query, setQuery] = useState("");
 
-      const response = await fetch(`${API_BASE_URL}/api/extract`, {
-        method: "POST",
-        credentials: "include",
-        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-        body: form,
-      });
+  const filteredChecks = useMemo(() => {
+    if (!report) return [];
 
-      if (!response.ok) {
-        let message = `Extraction failed (${response.status}).`;
-        try {
-          const body = await response.json();
-          message = body.detail || message;
-        } catch {}
-        throw new Error(message);
-      }
+    return report.checks.filter((item) => {
+      const matchesFilter =
+        filter === "all" ||
+        (filter === "found" && item.status === "found") ||
+        (filter === "review" && item.status === "review") ||
+        (filter === "missing" && item.status === "missing");
 
-      const data = await response.json();
+      const needle = query.trim().toLowerCase();
+      const matchesQuery =
+        !needle ||
+        item.label.toLowerCase().includes(needle) ||
+        item.value.toLowerCase().includes(needle) ||
+        item.category.toLowerCase().includes(needle);
 
-      const normalised = {
-        ...data,
-        sections: (data.sections || []).map((section, index) => ({
-          ...section,
-          original_index: section.original_index ?? index,
-          id: section.id ?? index,
-        })),
-        section_count: data.section_count ?? data.sections?.length ?? 0,
-      };
+      return matchesFilter && matchesQuery;
+    });
+  }, [report, filter, query]);
 
-      setResult(normalised);
-      localStorage.setItem(LAST_RESULT_KEY, JSON.stringify(normalised));
-      setSelectedId(normalised.sections?.[0]?.id ?? 0);
-      setScreen("filing");
-    } catch (error) {
-      setExtractError(error.message || "Could not extract this filing.");
-      URL.revokeObjectURL(localUrl);
-      setPdfUrl(null);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function understandSelected() {
-    if (!selectedSection) return;
-
-    setAiLoading(true);
-    setAiError("");
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/understand`, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-        },
-        body: JSON.stringify({
-          heading: selectedSection.heading,
-          text: getText(selectedSection),
-        }),
-      });
-
-      if (!response.ok) {
-        let message = `AI request failed (${response.status}).`;
-        try {
-          const body = await response.json();
-          message = body.detail || message;
-        } catch {}
-        throw new Error(message);
-      }
-
-      const data = await response.json();
-      setAi(data);
-      return true;
-    } catch (error) {
-      setAi(null);
-      setAiError(error.message || "AI understanding failed.");
-      return false;
-    } finally {
-      setAiLoading(false);
-    }
-  }
-
-  function selectSection(section, id) {
-    setSelectedId(id);
-    setAi(null);
-    setAiError("");
-  }
-
-  function logout() {
-    localStorage.removeItem(USER_KEY);
-    setAccessToken("");
-    setUser(null);
-    resetWorkspace();
-  }
-
-  if (authRestoring) {
+  if (!hasFiling || !report) {
     return (
-      <main className="auth-screen">
-        <section className="auth-card auth-loading-card">
-          <div className="brand-mark"><Icon name="lock" size={20} /></div>
-          <strong>Restoring secure session...</strong>
-          <span>Please wait.</span>
-        </section>
-      </main>
+      <div className="review-screen">
+        <div className="review-empty-card">
+          <div className="review-empty-icon">
+            <Icon name="file" size={24} />
+          </div>
+          <div className="panel-eyebrow">FILING REVIEW</div>
+          <h1>No filing to review</h1>
+          <p>
+            Upload and extract a SERFF filing from Home. The review results will
+            populate automatically as soon as extraction completes.
+          </p>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={onGoHome}
+          >
+            <Icon name="upload" size={16} />
+            Upload a filing
+          </button>
+        </div>
+      </div>
     );
   }
 
-  if (!user || !accessToken) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
-  }
-
-  const filingInfo = result ? buildFilingInfo(result) : {};
-
   return (
-    <div className={`application-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <Sidebar
-        screen={
-          screen === "home"
-            ? "home"
-            : screen === "results"
-            ? "results"
-            : "filing"
-        }
-        collapsed={sidebarCollapsed}
-        onToggle={() => setSidebarCollapsed((value) => !value)}
-        onHome={() => setScreen("home")}
-        onCurrent={() => {
-          if (result) setScreen("filing");
-          else setScreen("home");
-        }}
-        onReview={() => {
-          if (result) setScreen("results");
-          else setScreen("home");
-        }}
-        filename={result?.filename}
-        user={user}
-        onLogout={logout}
-      />
+    <div className="review-screen review-screen-live">
+      <div className="review-header">
+        <div>
+          <div className="panel-eyebrow">FILING REVIEW</div>
+          <h1>Review results</h1>
+          <p>
+            Live checks generated from the extracted filing. This is an
+            information review, not a legal or compliance determination.
+          </p>
+        </div>
 
-      <main className="main-shell">
-        {screen === "home" && (
-          <HomeScreen
-            onFile={handleFile}
-            loading={loading}
-            error={extractError}
-          />
-        )}
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={onGoToFiling}
+        >
+          <Icon name="arrowLeft" size={15} />
+          Current filing
+        </button>
+      </div>
 
-        {screen === "filing" && result && (
-          <div className="filing-workspace">
-            <FilingHeader
-              result={result}
-              onNew={resetWorkspace}
-              onOriginal={() => setPdfOpen(true)}
-            />
+      <div className="review-filing-bar">
+        <div>
+          <span>Current filing</span>
+          <strong>{result.filename}</strong>
+        </div>
+        <div className="review-filing-meta">
+          <span>{result.page_count || 0} pages</span>
+          <span>{result.section_count || result.sections?.length || 0} sections</span>
+          <span className="live-indicator">
+            <i />
+            Live
+          </span>
+        </div>
+      </div>
 
-            <div className="workspace-tabs">
-              <span className="active">All</span>
-              <span>Core</span>
-              <span>Correspondence</span>
-              <span>Documents</span>
+      <div className="review-summary-grid">
+        <div className="review-summary-card">
+          <span>Found</span>
+          <strong>{report.counts.found}</strong>
+          <small>details present</small>
+        </div>
+        <div className="review-summary-card review-summary-card-warning">
+          <span>Needs review</span>
+          <strong>{report.counts.review}</strong>
+          <small>ambiguous values</small>
+        </div>
+        <div className="review-summary-card review-summary-card-danger">
+          <span>Missing</span>
+          <strong>{report.counts.missing}</strong>
+          <small>not found in text</small>
+        </div>
+        <div className="review-summary-card">
+          <span>Document signals</span>
+          <strong>{report.counts.documentsFound}</strong>
+          <small>of {report.documentChecks.length} detected</small>
+        </div>
+      </div>
+
+      <div className="review-content-grid">
+        <section className="review-panel">
+          <div className="review-panel-header">
+            <div>
+              <div className="panel-eyebrow">FILING DETAILS</div>
+              <h2>Information check</h2>
+            </div>
+            <span className="review-count-pill">
+              {filteredChecks.length}/{report.counts.total}
+            </span>
+          </div>
+
+          <div className="review-toolbar">
+            <div className="review-search">
+              <Icon name="search" size={16} />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search review items..."
+                aria-label="Search review items"
+              />
             </div>
 
-            <div className="workspace-grid">
-              <FilingInformation
-                info={filingInfo}
-                pageCount={result.page_count}
-              />
-
-              <SectionList
-                sections={sections}
-                selectedId={selectedId}
-                onSelect={selectSection}
-              />
-
-              {selectedSection ? (
-                <SectionViewer
-                  section={selectedSection}
-                  ai={ai}
-                  aiLoading={aiLoading}
-                  aiError={aiError}
-                  onUnderstand={understandSelected}
-                  onResetAi={() => setAi(null)}
-                />
-              ) : (
-                <section className="panel core-panel empty-panel">
-                  <Icon name="file" size={22} />
-                  <strong>No section selected</strong>
-                  <span>Select a section to inspect its source.</span>
-                </section>
-              )}
+            <div className="review-filter-tabs">
+              {[
+                ["all", "All"],
+                ["found", "Found"],
+                ["review", "Review"],
+                ["missing", "Missing"],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={filter === value ? "active" : ""}
+                  onClick={() => setFilter(value)}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
           </div>
-        )}
 
-        {screen === "results" && result && (
-          <ReviewScreen
-            result={result}
-            filingInfo={filingInfo}
-            onBackToFiling={() => setScreen("filing")}
+          <div className="review-list">
+            {filteredChecks.map((item) => (
+              <div className="review-row" key={item.key}>
+                <div className={`review-row-icon review-row-icon-${item.status}`}>
+                  <Icon
+                    name={
+                      item.status === "found"
+                        ? "check"
+                        : item.status === "review"
+                        ? "eye"
+                        : "close"
+                    }
+                    size={16}
+                  />
+                </div>
+
+                <div className="review-row-main">
+                  <div className="review-row-top">
+                    <strong>{item.label}</strong>
+                    <ReviewStatusBadge status={item.status} />
+                  </div>
+                  <div className="review-row-value">{item.value}</div>
+                  <div className="review-row-source">
+                    {item.category} · Source: {item.source}
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            {filteredChecks.length === 0 && (
+              <div className="review-no-results">
+                No review items match the current filter.
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="review-panel review-documents-panel">
+          <div className="review-panel-header">
+            <div>
+              <div className="panel-eyebrow">DOCUMENT SIGNALS</div>
+              <h2>Files & references</h2>
+            </div>
+            <span className="review-count-pill">
+              {report.counts.documentsFound}/{report.documentChecks.length}
+            </span>
+          </div>
+
+          <div className="review-document-list">
+            {report.documentChecks.map((item) => (
+              <div className="review-document-item" key={item.key}>
+                <div className={item.found ? "document-signal found" : "document-signal missing"}>
+                  <Icon name={item.found ? "check" : "close"} size={15} />
+                </div>
+                <div>
+                  <strong>{item.label}</strong>
+                  <p>{item.description}</p>
+                  <small>{item.evidence}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="review-note">
+            <Icon name="eye" size={16} />
+            <div>
+              <strong>Human review stays in control</strong>
+              <p>
+                These signals are derived only from the extracted PDF text.
+                Missing here means “not detected,” not “not legally required.”
+              </p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   17. RESULTS SCREEN
+   ============================================================ */
+
+function ResultsScreen({
+  user,
+  result,
+  file,
+  pdfUrl,
+  onNewFiling,
+  onLogout,
+  onGoHome,
+  onOpenReview,
+}) {
+  const [activeTab, setActiveTab] = useState("All");
+  const [sectionSearch, setSectionSearch] = useState("");
+  const [globalSearch, setGlobalSearch] = useState("");
+  const [activeSectionId, setActiveSectionId] = useState(0);
+  const [aiState, setAiState] = useState({
+    loading: false,
+    data: null,
+    error: "",
+  });
+  const [showingSource, setShowingSource] = useState(false);
+  const [showPdfViewer, setShowPdfViewer] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  const requestIdRef = useRef(0);
+
+  const sections = useMemo(
+    () =>
+      (result.sections || []).map((section, index) => ({
+        ...section,
+        id: index,
+      })),
+    [result.sections]
+  );
+
+  const filingInfo = useMemo(
+    () => buildFilingInfo(result),
+    [result]
+  );
+
+  const documentLinks = useMemo(
+    () => buildDocumentLinks(result),
+    [result]
+  );
+
+  const tabSections = useMemo(() => {
+    if (activeTab === "All") return sections;
+
+    return sections.filter(
+      (section) => getSectionGroup(section) === activeTab
+    );
+  }, [sections, activeTab]);
+
+  const searchedSections = useMemo(() => {
+    const query = cleanValue(sectionSearch).toLowerCase();
+
+    if (!query) return tabSections;
+
+    return tabSections.filter((section) => {
+      const haystack =
+        `${section.heading} ${section.text}`.toLowerCase();
+
+      return haystack.includes(query);
+    });
+  }, [tabSections, sectionSearch]);
+
+  const selectedSection = useMemo(() => {
+    return (
+      sections.find((section) => section.id === activeSectionId) ||
+      searchedSections[0] ||
+      tabSections[0] ||
+      sections[0] ||
+      null
+    );
+  }, [
+    sections,
+    activeSectionId,
+    searchedSections,
+    tabSections,
+  ]);
+
+  const selectedSectionInCurrentList = searchedSections.some(
+    (section) => section.id === selectedSection?.id
+  );
+
+  useEffect(() => {
+    if (!sections.length) return;
+
+    if (!selectedSectionInCurrentList) {
+      const fallback =
+        searchedSections[0] ||
+        tabSections[0] ||
+        sections[0];
+
+      if (fallback && fallback.id !== activeSectionId) {
+        setActiveSectionId(fallback.id);
+      }
+    }
+  }, [
+    sections,
+    searchedSections,
+    tabSections,
+    selectedSectionInCurrentList,
+    activeSectionId,
+  ]);
+
+  useEffect(() => {
+    setAiState({
+      loading: false,
+      data: null,
+      error: "",
+    });
+    setShowingSource(false);
+    requestIdRef.current += 1;
+  }, [activeSectionId]);
+
+  const selectSection = (sectionId) => {
+    setActiveSectionId(sectionId);
+  };
+
+  const changeTab = (tab) => {
+    setActiveTab(tab);
+
+    const nextSections =
+      tab === "All"
+        ? sections
+        : sections.filter(
+            (section) => getSectionGroup(section) === tab
+          );
+
+    const query = cleanValue(sectionSearch).toLowerCase();
+
+    const nextVisible = query
+      ? nextSections.filter((section) =>
+          `${section.heading} ${section.text}`
+            .toLowerCase()
+            .includes(query)
+        )
+      : nextSections;
+
+    if (nextVisible[0]) {
+      setActiveSectionId(nextVisible[0].id);
+    }
+  };
+
+  const changeSectionSearch = (value) => {
+    setSectionSearch(value);
+
+    const query = cleanValue(value).toLowerCase();
+
+    const visible = tabSections.filter((section) =>
+      query
+        ? `${section.heading} ${section.text}`
+            .toLowerCase()
+            .includes(query)
+        : true
+    );
+
+    if (visible[0]) {
+      setActiveSectionId(visible[0].id);
+    }
+  };
+
+  const understandSection = async () => {
+    if (!selectedSection || !cleanValue(selectedSection.text)) return;
+
+    const requestId = ++requestIdRef.current;
+
+    setAiState({
+      loading: true,
+      data: null,
+      error: "",
+    });
+
+    setShowingSource(false);
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/understand`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            heading: selectedSection.heading,
+            text: selectedSection.text,
+          }),
+        }
+      );
+
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(
+          payload.detail ||
+            `AI request failed with status ${response.status}.`
+        );
+      }
+
+      if (requestId !== requestIdRef.current) return;
+
+      setAiState({
+        loading: false,
+        data: payload,
+        error: "",
+      });
+    } catch (error) {
+      if (requestId !== requestIdRef.current) return;
+
+      setAiState({
+        loading: false,
+        data: null,
+        error: formatError(
+          error,
+          "Unable to understand this section."
+        ),
+      });
+    }
+  };
+
+  const exportJson = () => {
+    const payload = JSON.stringify(result, null, 2);
+
+    downloadBlob(
+      new Blob([payload], {
+        type: "application/json;charset=utf-8",
+      }),
+      `${result.filename || "serff-filing"}.json`
+    );
+  };
+
+  return (
+    <div
+      className={`application-shell ${
+        sidebarCollapsed ? "sidebar-collapsed" : ""
+      }`}
+    >
+      <aside className="app-sidebar">
+        <div className="sidebar-header">
+          <div className="sidebar-brand">
+            <div className="brand-mark">
+              <Icon name="file" size={19} />
+            </div>
+
+            <div className="sidebar-brand-copy">
+              <strong>SERFF</strong>
+              <span>Filing Workspace</span>
+            </div>
+          </div>
+        </div>
+
+        <nav className="sidebar-nav" aria-label="Primary navigation">
+          <button
+            type="button"
+            className="sidebar-nav-item"
+            onClick={onGoHome}
+            title="Home"
+          >
+            <Icon name="file" size={18} />
+            <span>Home</span>
+          </button>
+
+          <button
+            type="button"
+            className="sidebar-nav-item active"
+            title="Current Filing"
+          >
+            <Icon name="file" size={18} />
+            <span>Current Filing</span>
+          </button>
+
+          <button
+            type="button"
+            className="sidebar-nav-item"
+            onClick={onOpenReview}
+            title="Review"
+          >
+            <Icon name="check" size={18} />
+            <span>Review</span>
+          </button>
+        </nav>
+
+        <div className="sidebar-filing">
+          <span>Current filing</span>
+          <strong>{result.filename || "No filing loaded"}</strong>
+        </div>
+      </aside>
+
+      <AppTopbar
+        user={user}
+        search={globalSearch}
+        onSearch={(value) => {
+          setGlobalSearch(value);
+          setSectionSearch(value);
+        }}
+        onLogout={onLogout}
+        onMenu={() => setSidebarCollapsed((value) => !value)}
+      />
+
+      <main className="results-workspace">
+        <div className="results-toolbar">
+          <div className="filing-title">
+            <div className="filing-title-icon">
+              <Icon name="file" size={21} />
+            </div>
+
+            <div>
+              <h1>{result.filename}</h1>
+              <p>
+                {result.page_count} pages ·{" "}
+                {result.section_count ?? sections.length} sections extracted
+              </p>
+            </div>
+          </div>
+
+          <div className="results-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={onNewFiling}
+            >
+              <Icon name="arrowLeft" size={15} />
+              New filing
+            </button>
+
+            <button
+              type="button"
+              className="primary-button"
+              onClick={exportJson}
+            >
+              <Icon name="download" size={15} />
+              Export JSON
+            </button>
+          </div>
+        </div>
+
+        <div className="workspace-tabs-row">
+          <SectionTabs
+            activeTab={activeTab}
+            onTabChange={changeTab}
           />
-        )}
+
+          <button
+            type="button"
+            className="secondary-button original-pdf-button"
+            onClick={() => setShowPdfViewer(true)}
+            disabled={!pdfUrl}
+          >
+            <Icon name="eye" size={15} />
+            View original PDF
+          </button>
+        </div>
+
+        <div className="workspace-grid">
+          <FilingInformation info={filingInfo} />
+
+          {activeTab === "Documents" ? (
+            <DocumentsPanel
+              links={documentLinks}
+              onOpenPdf={() => setShowPdfViewer(true)}
+            />
+          ) : (
+            <SectionsPanel
+              sections={tabSections}
+              activeSectionId={selectedSection?.id ?? null}
+              onSectionClick={selectSection}
+              search={sectionSearch}
+              onSearchChange={changeSectionSearch}
+            />
+          )}
+
+          <SelectedSectionPanel
+            section={selectedSection}
+            aiState={aiState}
+            onUnderstand={understandSection}
+            onRefresh={understandSection}
+            onViewSource={() =>
+              setShowingSource((value) => !value)
+            }
+            showingSource={showingSource}
+          />
+        </div>
       </main>
 
-      <PDFModal
-        open={pdfOpen}
-        url={pdfUrl}
-        filename={result?.filename || "Filing PDF"}
-        onClose={() => setPdfOpen(false)}
+      <PdfViewerModal
+        file={file}
+        pdfUrl={pdfUrl}
+        isOpen={showPdfViewer}
+        onClose={() => setShowPdfViewer(false)}
       />
     </div>
+  );
+}
+
+
+/* ============================================================
+   18. ROOT APPLICATION
+   ============================================================ */
+
+export default function App() {
+  const [user, setUser] = useState(() => readSession());
+  const [screen, setScreen] = useState(
+    () => (readSession() ? "upload" : "auth")
+  );
+
+  const [file, setFile] = useState(null);
+  const [pdfUrl, setPdfUrl] = useState("");
+  const pdfUrlRef = useRef("");
+
+  const [result, setResult] = useState(EMPTY_RESULT);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    return () => {
+      if (pdfUrlRef.current) {
+        URL.revokeObjectURL(pdfUrlRef.current);
+        pdfUrlRef.current = "";
+      }
+    };
+  }, []);
+
+  const createPdfUrl = (nextFile) => {
+    if (pdfUrlRef.current) {
+      URL.revokeObjectURL(pdfUrlRef.current);
+    }
+
+    const nextUrl = URL.createObjectURL(nextFile);
+
+    pdfUrlRef.current = nextUrl;
+    setPdfUrl(nextUrl);
+
+    return nextUrl;
+  };
+
+  const handleAuthenticated = (session) => {
+    setUser(session);
+    setScreen("upload");
+    setError("");
+  };
+
+  const handleLogout = () => {
+    clearSession();
+
+    setUser(null);
+    setScreen("auth");
+    setFile(null);
+    setResult(EMPTY_RESULT);
+    setError("");
+  };
+
+  const handleFileSelected = async (nextFile) => {
+    if (!nextFile) return;
+
+    if (
+      nextFile.type !== "application/pdf" &&
+      !nextFile.name.toLowerCase().endsWith(".pdf")
+    ) {
+      setError("Please select a PDF file.");
+      return;
+    }
+
+    if (nextFile.size === 0) {
+      setError("The selected PDF is empty.");
+      return;
+    }
+
+    setError("");
+    setFile(nextFile);
+
+    // IMPORTANT:
+    // Keep the browser object URL alive for the entire review session.
+    // This powers the original-PDF viewer.
+    createPdfUrl(nextFile);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", nextFile);
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/extract`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(
+          payload.detail ||
+            `Extraction failed with status ${response.status}.`
+        );
+      }
+
+      setResult(payload);
+      setScreen("results");
+    } catch (uploadError) {
+      setError(
+        formatError(
+          uploadError,
+          "Unable to extract the PDF."
+        )
+      );
+    }
+  };
+
+  const handleNewFiling = () => {
+    setResult(EMPTY_RESULT);
+    setFile(null);
+    setError("");
+    setScreen("upload");
+  };
+
+  if (!user || screen === "auth") {
+    return (
+      <AuthScreen
+        onAuthenticated={handleAuthenticated}
+      />
+    );
+  }
+
+  if (screen === "upload") {
+    return (
+      <UploadScreen
+        user={user}
+        onFileSelected={handleFileSelected}
+        error={error}
+      />
+    );
+  }
+
+  if (screen === "review") {
+    return (
+      <div className="application-shell review-application-shell">
+        <aside className="app-sidebar">
+          <div className="sidebar-header">
+            <div className="sidebar-brand">
+              <div className="brand-mark">
+                <Icon name="file" size={19} />
+              </div>
+
+              <div className="sidebar-brand-copy">
+                <strong>SERFF</strong>
+                <span>Filing Workspace</span>
+              </div>
+            </div>
+          </div>
+
+          <nav className="sidebar-nav" aria-label="Primary navigation">
+            <button
+              type="button"
+              className="sidebar-nav-item"
+              onClick={() => setScreen("upload")}
+              title="Home"
+            >
+              <Icon name="file" size={18} />
+              <span>Home</span>
+            </button>
+
+            <button
+              type="button"
+              className="sidebar-nav-item"
+              onClick={() => setScreen("results")}
+              title="Current Filing"
+            >
+              <Icon name="file" size={18} />
+              <span>Current Filing</span>
+            </button>
+
+            <button
+              type="button"
+              className="sidebar-nav-item active"
+              title="Review"
+            >
+              <Icon name="check" size={18} />
+              <span>Review</span>
+            </button>
+          </nav>
+
+          <div className="sidebar-filing">
+            <span>Current filing</span>
+            <strong>{result.filename || "No filing loaded"}</strong>
+          </div>
+        </aside>
+
+        <main className="review-main">
+          <ReviewScreen
+            result={result}
+            onGoToFiling={() => setScreen("results")}
+            onGoHome={() => setScreen("upload")}
+          />
+        </main>
+      </div>
+    );
+  }
+
+  return (
+    <ResultsScreen
+      user={user}
+      result={result}
+      file={file}
+      pdfUrl={pdfUrl}
+      onNewFiling={handleNewFiling}
+      onLogout={handleLogout}
+      onGoHome={() => setScreen("upload")}
+      onOpenReview={() => setScreen("review")}
+    />
   );
 }
